@@ -102,14 +102,11 @@ export const useBaseStore = defineStore('baseStore', {
       //check if the block exists in recents
       if (this.recents.findIndex((x) => x?.block_id?.hash === this.latest?.block_id?.hash) === -1) {
         if (this.recents.length === 0) {
-          // Cold start (e.g. page refresh): backfill the recent window in one shot so
-          // the /block and /tx pages are populated immediately.
+          // Cold start (e.g. page refresh): backfill the recent window, rendering each
+          // block as it arrives instead of waiting for the whole window to load.
           seedingInFlight = true;
           try {
-            const seeded = await this.seedRecentBlocks();
-            this.recents = [...seeded, this.latest].slice(-RECENT_BLOCKS_LIMIT);
-            // Use the oldest seeded block as the earliest so blocktime is accurate at once.
-            if (seeded.length) this.earliest = seeded[0];
+            await this.seedRecentBlocks();
           } finally {
             seedingInFlight = false;
           }
@@ -143,27 +140,32 @@ export const useBaseStore = defineStore('baseStore', {
       return newBlocks;
     },
     /**
-     * Backfills the most recent blocks so the UI has a full window immediately after a
-     * cold start (page refresh / chain switch) instead of accumulating one block per poll.
-     * Fetches sequentially and skips any block that fails, so a single bad height cannot
-     * abort the whole seed. The latest block is appended by the caller, so this stops at
-     * latestHeight - 1. Returns the fetched blocks in ascending height order.
+     * Backfills the most recent blocks after a cold start (page refresh / chain switch)
+     * so the block/tx views don't stay empty. Renders progressively: the latest block is
+     * shown immediately, then older blocks are fetched newest-first and prepended one by
+     * one as they arrive (keeping recents in ascending order with latest last), so each
+     * fetched block appears without waiting for the whole window. Skips any height that
+     * fails without aborting the seed.
      */
-    async seedRecentBlocks(): Promise<Block[]> {
+    async seedRecentBlocks(): Promise<void> {
       const latestHeight = Number(this.latest?.block?.header?.height);
-      if (!latestHeight) return [];
+      if (!latestHeight) return;
       const seedCount = Math.min(Number(RECENT_BLOCKS_LIMIT) || 50, INITIAL_BLOCK_SEED);
       const start = Math.max(1, latestHeight - seedCount + 1);
-      const blocks: Block[] = [];
-      for (let h = start; h < latestHeight; h++) {
+      // Show the latest block right away, then fill in older blocks progressively.
+      this.recents = [this.latest];
+      this.earliest = this.latest;
+      for (let h = latestHeight - 1; h >= start; h--) {
         try {
           const block = await this.fetchBlock(h);
-          if (block?.block?.header?.height) blocks.push(block);
+          if (block?.block?.header?.height) {
+            this.recents = [block, ...this.recents].slice(-RECENT_BLOCKS_LIMIT);
+            this.earliest = block; // oldest fetched so far → accurate blocktime
+          }
         } catch (error) {
           console.error(`Error seeding block ${h}:`, error);
         }
       }
-      return blocks;
     },
     async fetchValidatorByHeight(height?: number, offset = 0) {
       return this.blockchain.rpc.getBaseValidatorsetAt(String(height), offset);
