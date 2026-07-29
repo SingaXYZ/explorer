@@ -12,6 +12,9 @@ const RECENT_BLOCKS_LIMIT = import.meta.env.VITE_RECENT_BLOCK_LIMIT || 50;
 // recent-blocks / recent-txs views are populated immediately instead of growing one
 // block per polling interval. Defaults to the recent-blocks window size.
 const INITIAL_BLOCK_SEED = Number(import.meta.env.VITE_INITIAL_BLOCK_SEED) || Number(RECENT_BLOCKS_LIMIT) || 50;
+// Max number of historical blocks fetched in parallel while seeding. Keep it modest to
+// avoid rate limiting on public nodes; raise it for private/high-throughput endpoints.
+const SEED_CONCURRENCY = Math.max(1, Number(import.meta.env.VITE_SEED_CONCURRENCY) || 5);
 
 // Prevents overlapping seed backfills when polls fire while a seed is still running.
 let seedingInFlight = false;
@@ -141,31 +144,53 @@ export const useBaseStore = defineStore('baseStore', {
     },
     /**
      * Backfills the most recent blocks after a cold start (page refresh / chain switch)
-     * so the block/tx views don't stay empty. Renders progressively: the latest block is
-     * shown immediately, then older blocks are fetched newest-first and prepended one by
-     * one as they arrive (keeping recents in ascending order with latest last), so each
-     * fetched block appears without waiting for the whole window. Skips any height that
-     * fails without aborting the seed.
+     * so the block/tx views don't stay empty. The latest block is shown immediately, then
+     * older blocks are fetched concurrently (bounded by SEED_CONCURRENCY) and each is
+     * inserted into recents by height as soon as it arrives — so blocks render one by one
+     * as they land, out of fetch order but always kept in ascending height order. Skips
+     * any height that fails without aborting the seed.
      */
     async seedRecentBlocks(): Promise<void> {
       const latestHeight = Number(this.latest?.block?.header?.height);
       if (!latestHeight) return;
       const seedCount = Math.min(Number(RECENT_BLOCKS_LIMIT) || 50, INITIAL_BLOCK_SEED);
       const start = Math.max(1, latestHeight - seedCount + 1);
-      // Show the latest block right away, then fill in older blocks progressively.
+
+      // Show the latest block right away; older blocks fill in as they arrive.
       this.recents = [this.latest];
       this.earliest = this.latest;
-      for (let h = latestHeight - 1; h >= start; h--) {
-        try {
-          const block = await this.fetchBlock(h);
-          if (block?.block?.header?.height) {
-            this.recents = [block, ...this.recents].slice(-RECENT_BLOCKS_LIMIT);
-            this.earliest = block; // oldest fetched so far → accurate blocktime
+
+      // Inserts a block into recents keeping ascending height order (dedup + cap).
+      const insert = (block: Block) => {
+        const height = Number(block?.block?.header?.height);
+        if (!height || this.recents.some((b) => Number(b?.block?.header?.height) === height)) return;
+        const next = [...this.recents];
+        let idx = next.findIndex((b) => Number(b?.block?.header?.height) > height);
+        if (idx === -1) idx = next.length;
+        next.splice(idx, 0, block);
+        this.recents = next.slice(-RECENT_BLOCKS_LIMIT);
+        this.earliest = this.recents[0]; // oldest in window → accurate blocktime
+      };
+
+      // Backfill newest-first so nearer history tends to appear soonest.
+      const heights: number[] = [];
+      for (let h = latestHeight - 1; h >= start; h--) heights.push(h);
+
+      // Bounded worker pool: `cursor` is safe to share since it only advances between awaits.
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < heights.length) {
+          const h = heights[cursor++];
+          try {
+            const block = await this.fetchBlock(h);
+            if (block?.block?.header?.height) insert(block);
+          } catch (error) {
+            console.error(`Error seeding block ${h}:`, error);
           }
-        } catch (error) {
-          console.error(`Error seeding block ${h}:`, error);
         }
-      }
+      };
+      const poolSize = Math.min(SEED_CONCURRENCY, heights.length);
+      await Promise.all(Array.from({ length: poolSize }, () => worker()));
     },
     async fetchValidatorByHeight(height?: number, offset = 0) {
       return this.blockchain.rpc.getBaseValidatorsetAt(String(height), offset);
